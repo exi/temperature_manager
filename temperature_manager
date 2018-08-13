@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+
+# This is a small python utility to better control the fan speeds of my
+# asrock rack C2550D4I mainboard.
+# If you want to use this, you have to make some modifications for your use.
+# The Metric class takes a metric_fn as an argument which you have to change
+# to fit your use case. 
+# You can use get_sys to control on the CPU temperature.
+# You can use smart_temp() to control on HDD temperature.
+#
+# The control code will monitor each metric. If one moves up, we increase fan speed.
+# If all metrics move down or stay the same, we reduce fan speed.
+# If one metric goes over it's limit, we set fan speed to max.
+
+from subprocess import Popen, PIPE
+
+from collections import namedtuple
+from time import sleep
+from enum import Enum
+import logging
+import re
+
+FAN_VALUES = [hex(n) for n in range(4, 101)]
+STARTING_FAN_SPEED = int(len(FAN_VALUES) / 2)
+FAN_UP_TICK = 10
+FAN_DOWN_TICK = 2
+LOGGER = logging.getLogger('temperature_manager')
+LOGGER.setLevel(logging.DEBUG)
+fh = logging.FileHandler('temperature_manager.log')
+fh.setLevel(logging.DEBUG)
+ch = logging.StreamHandler()
+ch.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+fh.setFormatter(formatter)
+ch.setFormatter(formatter)
+LOGGER.addHandler(fh)
+LOGGER.addHandler(ch)
+
+class Direction(Enum):
+    UP = 1
+    DOWN = 2
+    STABLE = 3
+
+class Metric:
+    def __init__(self, name, metric_fn, temp_limit):
+        self.name = name
+        self.metric_fn = metric_fn
+        self.temp_limit = temp_limit
+        self.prev_value = metric_fn()
+        self.cur_value = metric_fn()
+
+    def refresh(self):
+        self.prev_value = self.cur_value
+        self.cur_value = self.metric_fn()
+
+    def is_over_or_at_limit(self):
+        return self.cur_value >= self.temp_limit
+
+    def get_direction(self):
+        if self.cur_value == self.prev_value:
+            return Direction.STABLE
+        if self.cur_value > self.prev_value:
+            return Direction.UP
+        if self.cur_value < self.prev_value:
+            return Direction.DOWN
+
+    def get_name(self):
+        return self.name
+
+def smart_temp(device):
+    def fn():
+        p = Popen(['smartctl', '-A', device], stdout=PIPE, stderr=PIPE)
+        stdout, _ = p.communicate()
+        lines = stdout.decode('UTF-8').splitlines()
+        for l in lines:
+            # 194 is the ID# of Temperature_Celsius
+            if not l.startswith('194'):
+                continue
+            parts = [part.strip() for part in re.split('\s+', l)]
+            # Element number 10 in the line contains the temperature
+            return float(parts[9])
+        raise Exception('Failed to get %s temp' % device)
+    return fn
+
+def get_sys():
+    p = Popen(['ipmitool', 'sensor'], stdout=PIPE, stderr=PIPE)
+    stdout, _ = p.communicate()
+    lines = stdout.decode('UTF-8').splitlines()
+    for l in lines:
+        if not l.startswith('MB Temperature'):
+            continue
+        parts = [part.strip() for part in l.split(' | ')]
+        # Element number 2 in the line contains the temperature
+        return float(parts[1])
+    raise Exception('Failed to get sys temp')
+
+def set_fans(val):
+    LOGGER.info('setting fans to %s' % val)
+    p = Popen(['ipmitool', 'raw', '0x3a' ,'0x01' ,val ,val ,val ,val ,val ,val ,'0x00' ,'0x00'] , stdout=PIPE, stderr=PIPE)
+    p.communicate()
+
+def control():
+    metrics = [
+        Metric('sda', smart_temp('/dev/sda'), 43),
+        Metric('sdb', smart_temp('/dev/sdb'), 42),
+        Metric('sdc', smart_temp('/dev/sdc'), 43),
+        Metric('sdd', smart_temp('/dev/sdd'), 43),
+        Metric('sde', smart_temp('/dev/sde'), 43),
+        Metric('sdf', smart_temp('/dev/sdf'), 43),
+        Metric('sdg', smart_temp('/dev/sdg'), 43),
+        Metric('SYS', get_sys, 65),
+    ]
+    fan_speed = STARTING_FAN_SPEED
+    max_fan_speed = len(FAN_VALUES) - 1
+    min_fan_speed = 0
+    while True:
+        any_up = False
+        over_limit = False
+        for m in metrics:
+            m.refresh()
+            d = m.get_direction()
+            if d == Direction.UP:
+                LOGGER.info('%s went up' % m.get_name())
+                any_up = True
+            if m.is_over_or_at_limit():
+                LOGGER.info('%s is over limit' % m.get_name())
+                over_limit = True
+
+        if over_limit:
+            fan_speed = len(FAN_VALUES) - 1
+        elif any_up:
+            fan_speed = min(fan_speed + FAN_UP_TICK, max_fan_speed)
+        else:
+            fan_speed = max(fan_speed - FAN_DOWN_TICK, min_fan_speed)
+        set_fans(FAN_VALUES[fan_speed])
+        sleep(30)
+
+
+if __name__ == '__main__':
+    control()
