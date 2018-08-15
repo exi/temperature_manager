@@ -5,7 +5,7 @@
 # If you want to use this, you have to make some modifications for your use.
 # The Metric class takes a metric_fn as an argument which you have to change
 # to fit your use case. 
-# You can use get_sys to control on the CPU temperature.
+# You can use get_sys_temp to control on the CPU temperature.
 # You can use smart_temp() to control on HDD temperature.
 #
 # The control code will monitor each metric. If one moves up, we increase fan speed.
@@ -15,19 +15,24 @@
 from subprocess import Popen, PIPE
 
 from collections import namedtuple
-from time import sleep
+import time
 from enum import Enum
 import logging
 import re
+import csv
 
 FAN_VALUES = [hex(n) for n in range(4, 101)]
 STARTING_FAN_SPEED = int(len(FAN_VALUES) / 2)
-FAN_UP_TICK = 10
 FAN_DOWN_TICK = 2
 OVER_LIMIT_EXTRA_DELAY_SEC = 60 * 2
+
+LOG_FILE = 'temperature_manager.log'
+STATS_FILE_TEMPLATE = 'temperature_manager_stats_%s.csv'
+LOAD_FILE = '/proc/loadavg'
+
 LOGGER = logging.getLogger('temperature_manager')
 LOGGER.setLevel(logging.DEBUG)
-fh = logging.FileHandler('temperature_manager.log')
+fh = logging.FileHandler(LOG_FILE)
 fh.setLevel(logging.DEBUG)
 ch = logging.StreamHandler()
 ch.setLevel(logging.DEBUG)
@@ -42,13 +47,30 @@ class Direction(Enum):
     DOWN = 2
     STABLE = 3
 
+class StatsWriter():
+    def __init__(self, filename, metrics, fan_speed_fn, load_fn):
+        self.file = open(filename, 'w', newline='')
+        self.writer = csv.writer(self.file, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
+        self.metrics = sorted(metrics, key=lambda m: m.get_name())
+        self.writer.writerow(['timestamp', 'fanspeed', 'load'] + [m.get_name() for m in self.metrics])
+        self.fan_speed_fn = fan_speed_fn
+        self.load_fn = load_fn
+
+    def update(self):
+        self.writer.writerow(
+                [int(time.time())] +
+                [int(FAN_VALUES[self.fan_speed_fn()], 0), str(self.load_fn())] +
+                [m.get_current() for m in self.metrics])
+        self.file.flush()
+
 class Metric:
-    def __init__(self, name, metric_fn, temp_limit):
+    def __init__(self, name, metric_fn, normal_temp, temp_limit):
         self.name = name
         self.metric_fn = metric_fn
         self.temp_limit = temp_limit
         self.prev_value = metric_fn()
         self.cur_value = metric_fn()
+        self.normal_temp = normal_temp
 
     def refresh(self):
         self.prev_value = self.cur_value
@@ -64,6 +86,15 @@ class Metric:
             return Direction.UP
         if self.cur_value < self.prev_value:
             return Direction.DOWN
+
+    def get_limit(self):
+        return self.temp_limit
+
+    def get_current(self):
+        return self.cur_value
+
+    def get_normal(self):
+        return self.normal_temp
 
     def get_name(self):
         return self.name
@@ -83,7 +114,7 @@ def smart_temp(device):
         raise Exception('Failed to get %s temp' % device)
     return fn
 
-def get_sys():
+def get_sys_temp():
     p = Popen(['ipmitool', 'sensor'], stdout=PIPE, stderr=PIPE)
     stdout, _ = p.communicate()
     lines = stdout.decode('UTF-8').splitlines()
@@ -95,29 +126,55 @@ def get_sys():
         return float(parts[1])
     raise Exception('Failed to get sys temp')
 
+def get_cpu_temp():
+    p = Popen(['ipmitool', 'sensor'], stdout=PIPE, stderr=PIPE)
+    stdout, _ = p.communicate()
+    lines = stdout.decode('UTF-8').splitlines()
+    for l in lines:
+        if not l.startswith('CPU Temperature'):
+            continue
+        parts = [part.strip() for part in l.split(' | ')]
+        # Element number 2 in the line contains the temperature
+        return float(parts[1])
+    raise Exception('Failed to get sys temp')
+
 def set_fans(val):
     LOGGER.info('setting fans to %s' % val)
     p = Popen(['ipmitool', 'raw', '0x3a' ,'0x01' ,val ,val ,val ,val ,val ,val ,'0x00' ,'0x00'] , stdout=PIPE, stderr=PIPE)
     p.communicate()
 
+def get_load_avg():
+    with open(LOAD_FILE, 'r') as f:
+        line = f.readline()
+        parts = line.split(' ')
+        return float(parts[0])
+
 def control():
     metrics = [
-        Metric('sda', smart_temp('/dev/sda'), 43),
-        Metric('sdb', smart_temp('/dev/sdb'), 42),
-        Metric('sdc', smart_temp('/dev/sdc'), 43),
-        Metric('sdd', smart_temp('/dev/sdd'), 43),
-        Metric('sde', smart_temp('/dev/sde'), 43),
-        Metric('sdf', smart_temp('/dev/sdf'), 43),
-        Metric('sdg', smart_temp('/dev/sdg'), 43),
-        Metric('SYS', get_sys, 65),
+        Metric('sda', smart_temp('/dev/sda'), 35, 44),
+        Metric('sdb', smart_temp('/dev/sdb'), 35, 44),
+        Metric('sdc', smart_temp('/dev/sdc'), 35, 44),
+        Metric('sdd', smart_temp('/dev/sdd'), 35, 44),
+        Metric('sde', smart_temp('/dev/sde'), 35, 44),
+        Metric('sdf', smart_temp('/dev/sdf'), 35, 44),
+        Metric('sdg', smart_temp('/dev/sdg'), 35, 44),
+        Metric('SYS', get_sys_temp, 50, 65),
+        Metric('CPU', get_cpu_temp, 35, 65),
     ]
     fan_speed = STARTING_FAN_SPEED
+    stats_writer = StatsWriter(
+            STATS_FILE_TEMPLATE % int(time.time()),
+            metrics,
+            lambda: fan_speed,
+            get_load_avg)
+
     max_fan_speed = len(FAN_VALUES) - 1
     min_fan_speed = 0
     while True:
         any_up = False
         over_limit = False
         extra_delay = 0
+        max_ratio = float(0)
         for m in metrics:
             m.refresh()
             d = m.get_direction()
@@ -127,16 +184,25 @@ def control():
             if m.is_over_or_at_limit():
                 LOGGER.info('%s is over limit' % m.get_name())
                 over_limit = True
+            ratio = (m.get_current() - m.get_normal()) / (m.get_limit() - m.get_normal())
+            if ratio > max_ratio:
+                LOGGER.info('new max ratio: %s %s' % (m.get_name(), ratio))
+                max_ratio = ratio
+
+        max_ratio = min(1, max_ratio)
+        max_ratio = max(0, max_ratio)
+        LOGGER.info('max_ratio: %s' % max_ratio)
+        stats_writer.update()
 
         if over_limit:
             fan_speed = len(FAN_VALUES) - 1
             extra_delay = OVER_LIMIT_EXTRA_DELAY_SEC
         elif any_up:
-            fan_speed = min(fan_speed + FAN_UP_TICK, max_fan_speed)
+            fan_speed = min(int(max_fan_speed * max_ratio), max_fan_speed)
         else:
             fan_speed = max(fan_speed - FAN_DOWN_TICK, min_fan_speed)
         set_fans(FAN_VALUES[fan_speed])
-        sleep(30 + extra_delay)
+        time.sleep(30 + extra_delay)
 
 
 if __name__ == '__main__':
