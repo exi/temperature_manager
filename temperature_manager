@@ -4,14 +4,16 @@
 # asrock rack C2550D4I mainboard.
 # If you want to use this, you have to make some modifications for your use.
 # The Metric class takes a metric_fn as an argument which you have to change
-# to fit your use case. 
-# You can use get_sys_temp to control on the CPU temperature.
+# to fit your use case.
+# You can use get_sys_temp to control on the Motherboard temperature. This is usually higher than the CPU temp.
+# You can use get_cpu_temp to control on the CPU temperature.
 # You can use smart_temp() to control on HDD temperature.
 #
-# The control code will monitor each metric. If one moves up, we increase fan speed.
-# If all metrics move down or stay the same, we reduce fan speed.
-# If one metric goes over it's limit, we set fan speed to max.
-
+# The control code will monitor each metric.
+# If one metric moves up, we compute where in the min<->max temp range the current temperature is and adjust the fan
+# speeds by taking a fan speed that is at the same point in the min<->max fan speed range.
+# If no metric moves upwards, we reduce the fan speed by FAN_DOWN_TICK steps every 30 seconds.
+# If a metric moves over the max limit, we turn all fans to full speed and keep them there for 2 minutes.
 from subprocess import Popen, PIPE
 
 from collections import namedtuple
