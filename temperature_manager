@@ -22,14 +22,16 @@ from enum import Enum
 import logging
 import re
 import csv
+import glob
+import os
 
 FAN_VALUES = [hex(n) for n in range(4, 101)]
 STARTING_FAN_SPEED = int(len(FAN_VALUES) / 2)
 FAN_DOWN_TICK = 2
 OVER_LIMIT_EXTRA_DELAY_SEC = 60 * 2
 
-LOG_FILE = 'temperature_manager.log'
-STATS_FILE_TEMPLATE = 'temperature_manager_stats_%s.csv'
+LOG_FILE = '/var/log/temperature_manager/temperature_manager.log'
+STATS_FILE_TEMPLATE = '/var/log/temperature_manager/temperature_manager_stats_%s.csv'
 LOAD_FILE = '/proc/loadavg'
 
 LOGGER = logging.getLogger('temperature_manager')
@@ -101,6 +103,9 @@ class Metric:
     def get_name(self):
         return self.name
 
+    def __str__(self):
+        return 'Metric(%s, limit: %s, normal: %s)' % (self.name, self.temp_limit, self.normal_temp)
+
 def smart_temp(device):
     def fn():
         p = Popen(['smartctl', '-A', device], stdout=PIPE, stderr=PIPE)
@@ -153,16 +158,17 @@ def get_load_avg():
 
 def control():
     metrics = [
-        Metric('sda', smart_temp('/dev/sda'), 35, 44),
-        Metric('sdb', smart_temp('/dev/sdb'), 35, 44),
-        Metric('sdc', smart_temp('/dev/sdc'), 35, 44),
-        Metric('sdd', smart_temp('/dev/sdd'), 35, 44),
-        Metric('sde', smart_temp('/dev/sde'), 35, 44),
-        Metric('sdf', smart_temp('/dev/sdf'), 35, 44),
-        Metric('sdg', smart_temp('/dev/sdg'), 35, 44),
         Metric('SYS', get_sys_temp, 50, 65),
         Metric('CPU', get_cpu_temp, 35, 65),
     ]
+    LOGGER.info('discovering disks')
+    disks = glob.glob('/dev/disk/by-path/*-[!p][!a][!r][!t][0-9]')
+    for d in disks:
+        d = os.path.realpath(d)
+        short = str(d).split('/')[-1]
+        m = Metric(d, smart_temp(d), 35, 44)
+        metrics.append(m)
+        LOGGER.info('found %s' % str(m))
     fan_speed = STARTING_FAN_SPEED
     stats_writer = StatsWriter(
             STATS_FILE_TEMPLATE % int(time.time()),
